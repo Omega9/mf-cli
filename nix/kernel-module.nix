@@ -2,8 +2,12 @@
   lib,
   stdenv,
   kernel,
+  kernelModuleMakeFlags,
 }:
 
+let
+  kdir = "${kernel.dev}/lib/modules/${kernel.modDirVersion}/build";
+in
 stdenv.mkDerivation {
   pname = "minifuse-mod";
   version = (lib.importTOML ../Cargo.toml).package.version;
@@ -18,8 +22,8 @@ stdenv.mkDerivation {
 
   nativeBuildInputs = kernel.moduleBuildDependencies;
 
-  makeFlags = [
-    "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
+  makeFlags = kernelModuleMakeFlags ++ [
+    "KDIR=${kdir}"
   ];
 
   hardeningDisable = [
@@ -29,9 +33,12 @@ stdenv.mkDerivation {
 
   enableParallelBuilding = true;
 
+  # kbuild's modules_install runs the kernel's signing hook, which writes the
+  # minifuse_mod.ko.cer that NixOS needs when it aggregates the module tree.
   installPhase = ''
     runHook preInstall
-    install -Dm444 minifuse_mod.ko -t $out/lib/modules/${kernel.modDirVersion}/extra
+    make -C ${kdir} M="$PWD" ${lib.escapeShellArgs kernelModuleMakeFlags} \
+      INSTALL_MOD_PATH="$out" modules_install
     runHook postInstall
   '';
 
