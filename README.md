@@ -97,6 +97,8 @@ The syntax is straightforward: `mf-cli <target> <on|off> [<target> <on|off> ...]
 
 `mf-cli` detects which MiniFuse model is connected and uses the matching commands. It will also automatically detect if the kernel module is loaded. If it is, it will route commands seamlessly. If not, it will print a warning and fall back to userspace USB control.
 
+On success it prints one line with the model and what changed, for example `MiniFuse 1: inst on, 48v off`. Run `mf-cli --help` for the targets and examples, and `mf-cli --version` for the version.
+
 ### Supported targets
 
 | Target    | MiniFuse 1/2               | MiniFuse 4                         |

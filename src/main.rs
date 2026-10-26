@@ -1,5 +1,6 @@
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use rusb::{DeviceHandle, GlobalContext};
-use std::{env, fs, path::Path, thread::sleep, time::Duration};
+use std::{fs, path::Path, process, thread::sleep, time::Duration};
 
 const VID: u16 = 0x1c75;
 const PID_MF1: u16 = 0xaf80;
@@ -7,6 +8,25 @@ const PID_MF1_MSD: u16 = 0xaf82;
 const PID_MF2: u16 = 0xaf90;
 const PID_MF4: u16 = 0xaf70;
 const SYSFS_PATH: &str = "/dev/minifuse_cmd";
+
+const AFTER_HELP: &str = "\
+Targets:
+  MiniFuse 1/2  inst, 48v, monitor
+  MiniFuse 4    inst1 (or inst), inst2, 48v
+
+Examples:
+  mf-cli inst on
+  mf-cli 48v on monitor off
+  mf-cli inst1 on inst2 off 48v on";
+
+/// Toggle hardware settings on an Arturia MiniFuse.
+#[derive(Parser)]
+#[command(version, after_help = AFTER_HELP)]
+struct Cli {
+    /// Pairs of a target and its state (on or off)
+    #[arg(required = true, num_args = 2.., value_names = ["TARGET", "STATE"])]
+    settings: Vec<String>,
+}
 
 #[derive(Clone, Copy)]
 enum Model {
@@ -35,13 +55,21 @@ impl Model {
 
     fn targets(self) -> &'static str {
         match self {
-            Model::MiniFuse4 => "'inst1', 'inst2' or '48v'",
-            _ => "'inst', '48v' or 'monitor'",
+            Model::MiniFuse4 => "inst1, inst2 or 48v",
+            _ => "inst, 48v or monitor",
         }
     }
 }
 
-// wValue is (feature << 8) | channel
+/// One requested change, already validated against the connected model.
+struct Setting<'a> {
+    target: &'a str,
+    selector: u16,
+    enable: bool,
+}
+
+/// Maps a target name to the control transfer's wValue, which is
+/// `(feature << 8) | channel`. Returns `None` when the model lacks the target.
 fn parse_selector(model: Model, target: &str) -> Option<u16> {
     match model {
         Model::MiniFuse4 => match target {
@@ -59,152 +87,152 @@ fn parse_selector(model: Model, target: &str) -> Option<u16> {
     }
 }
 
+fn parse_state(state: &str) -> Option<bool> {
+    match state {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Prints `message` as an error and exits with status 1.
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("error: {message}");
+    process::exit(1);
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let cli = Cli::parse();
+    let mut cmd = Cli::command();
 
-    let pairs_args = &args[1..];
-
-    if pairs_args.is_empty() || pairs_args.len() % 2 != 0 {
-        eprintln!("Usage: mf-cli <target> <on|off> [<target> <on|off> ...]");
-        eprintln!("Targets:");
-        eprintln!("  MiniFuse 1/2: inst, 48v, monitor");
-        eprintln!("  MiniFuse 4:   inst1, inst2, 48v");
-        eprintln!("Examples:");
-        eprintln!("  mf-cli inst on");
-        eprintln!("  mf-cli 48v on monitor off");
-        eprintln!("  mf-cli inst1 on inst2 off 48v on");
-        std::process::exit(1);
+    let pairs = cli.settings.chunks_exact(2);
+    if !pairs.remainder().is_empty() {
+        cmd.error(
+            ErrorKind::WrongNumberOfValues,
+            "every target needs a state (on or off)",
+        )
+        .exit();
     }
 
-    let model = match detect_model() {
-        Some(m) => m,
-        None => {
-            eprintln!("Error: No MiniFuse device found.");
-            std::process::exit(1);
-        }
+    let Some(model) = detect_model() else {
+        fail("no MiniFuse found");
     };
 
-    let mut commands: Vec<(u16, bool, &str)> = Vec::new();
-    for chunk in pairs_args.chunks(2) {
-        let target = chunk[0].as_str();
-        let state = chunk[1].as_str();
-
-        let selector = match parse_selector(model, target) {
-            Some(s) => s,
-            None => {
-                eprintln!(
-                    "Error: Unknown target '{}' for {}. Use {}.",
-                    target,
+    let mut settings = Vec::new();
+    for pair in pairs {
+        let (target, state) = (pair[0].as_str(), pair[1].as_str());
+        let Some(selector) = parse_selector(model, target) else {
+            cmd.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "{} has no target '{target}', use {}",
                     model.name(),
                     model.targets()
-                );
-                std::process::exit(1);
-            }
+                ),
+            )
+            .exit();
         };
-
-        if state != "on" && state != "off" {
-            eprintln!(
-                "Error: Unknown state '{}' for target '{}'. Use 'on' or 'off'.",
-                state, target
-            );
-            std::process::exit(1);
-        }
-
-        let enable = state == "on";
-        commands.push((selector, enable, target));
-    }
-
-    // 1. Try using the seamless Kernel Module first
-    if Path::new(SYSFS_PATH).exists() {
-        println!(
-            "[*] Kernel module detected. Sending commands to {} seamlessly...",
-            model.name()
-        );
-        for (selector, enable, target) in &commands {
-            let cmd = format!("{:04x} {}", selector, if *enable { 1 } else { 0 });
-            match fs::write(SYSFS_PATH, &cmd) {
-                Ok(_) => {
-                    println!(
-                        "[+] {} toggled {}.",
-                        target,
-                        if *enable { "ON" } else { "OFF" }
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[-] Failed to write command for {} to kernel module: {}",
-                        target, e
-                    );
-                }
-            }
-            // Small delay to ensure the hardware processes sequential commands
-            sleep(Duration::from_millis(50));
-        }
-        println!("[*] All commands sent via kernel module.");
-        return;
-    }
-
-    // 2. Fallback to userspace USB manipulation
-    println!("[!] Kernel module not found. Falling back to userspace USB (audio may interrupt)...");
-
-    let mut handle = find_minifuse().expect("No MiniFuse device found or permission denied");
-
-    println!("[*] Found {}... applying settings", model.name());
-
-    for (selector, enable, target) in &commands {
-        toggle_feature(&mut handle, *selector, *enable);
-        println!(
-            "[+] {} toggled {}.",
+        let Some(enable) = parse_state(state) else {
+            cmd.error(
+                ErrorKind::InvalidValue,
+                format!("invalid state '{state}' for {target}, use on or off"),
+            )
+            .exit();
+        };
+        settings.push(Setting {
             target,
-            if *enable { "ON" } else { "OFF" }
-        );
+            selector,
+            enable,
+        });
+    }
+
+    if Path::new(SYSFS_PATH).exists() {
+        send_via_kernel_module(&settings);
+    } else {
+        eprintln!("warning: kernel module not loaded, using userspace USB (audio may drop out)");
+        send_via_usb(&settings);
+    }
+
+    let summary: Vec<String> = settings
+        .iter()
+        .map(|s| format!("{} {}", s.target, if s.enable { "on" } else { "off" }))
+        .collect();
+    println!("{}: {}", model.name(), summary.join(", "));
+}
+
+/// Sends each setting through the minifuse_mod device node, which leaves the
+/// audio stream running. Exits on the first write the module rejects.
+fn send_via_kernel_module(settings: &[Setting]) {
+    for setting in settings {
+        let cmd = format!("{:04x} {}", setting.selector, setting.enable as u8);
+        if let Err(e) = fs::write(SYSFS_PATH, &cmd) {
+            fail(format!("kernel module rejected {}: {e}", setting.target));
+        }
+        // Give the device time to process each command before the next one.
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// Sends each setting with libusb. Claiming the interface detaches the audio
+/// driver, so playback stops until the device reset at the end.
+fn send_via_usb(settings: &[Setting]) {
+    let mut handle = find_minifuse().unwrap_or_else(|e| fail(format!("cannot open MiniFuse: {e}")));
+
+    for setting in settings {
+        if let Err(e) = toggle_feature(&mut handle, setting.selector, setting.enable) {
+            fail(format!("failed to set {}: {e}", setting.target));
+        }
     }
 
     let _ = handle.reset();
-
-    println!("[*] All commands sent to {}.", model.name());
 }
 
 fn detect_model() -> Option<Model> {
     let devices = rusb::devices().ok()?;
     for device in devices.iter() {
         let device_desc = device.device_descriptor().ok()?;
-        if device_desc.vendor_id() == VID {
-            if let Some(model) = Model::from_pid(device_desc.product_id()) {
-                return Some(model);
-            }
+        if device_desc.vendor_id() != VID {
+            continue;
+        }
+        if let Some(model) = Model::from_pid(device_desc.product_id()) {
+            return Some(model);
         }
     }
     None
 }
 
-fn find_minifuse() -> Option<DeviceHandle<GlobalContext>> {
-    let devices = rusb::devices().ok()?;
-    for device in devices.iter() {
-        let device_desc = device.device_descriptor().ok()?;
+/// Opens the first supported MiniFuse. Returns the last open error, such as a
+/// permission error when the udev rule is missing, or `NoDevice` if none is
+/// connected.
+fn find_minifuse() -> Result<DeviceHandle<GlobalContext>, rusb::Error> {
+    let mut error = rusb::Error::NoDevice;
+    for device in rusb::devices()?.iter() {
+        let device_desc = device.device_descriptor()?;
         if device_desc.vendor_id() == VID && Model::from_pid(device_desc.product_id()).is_some() {
-            if let Ok(handle) = device.open() {
-                return Some(handle);
+            match device.open() {
+                Ok(handle) => return Ok(handle),
+                Err(e) => error = e,
             }
         }
     }
-    None
+    Err(error)
 }
 
-fn toggle_feature(handle: &mut DeviceHandle<GlobalContext>, selector: u16, enable: bool) {
+fn toggle_feature(
+    handle: &mut DeviceHandle<GlobalContext>,
+    selector: u16,
+    enable: bool,
+) -> Result<(), rusb::Error> {
     let _ = handle.set_auto_detach_kernel_driver(true);
 
     if let Err(e) = handle.claim_interface(0) {
-        eprintln!("Warning: Could not claim interface: {}", e);
+        eprintln!("warning: could not claim interface 0: {e}");
     }
 
-    let data = if enable { [1, 0] } else { [0, 0] };
-
-    // Control transfer
-    handle
-        .write_control(0x21, 34, selector, 0, &data, Duration::from_millis(200))
-        .expect("Failed to send control command");
+    let data = [enable as u8, 0];
+    let result = handle.write_control(0x21, 34, selector, 0, &data, Duration::from_millis(200));
 
     sleep(Duration::from_millis(100));
     let _ = handle.release_interface(0);
+    result.map(|_| ())
 }
